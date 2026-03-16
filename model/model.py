@@ -73,6 +73,9 @@ class MokioMindConfig(PretrainedConfig):
 
 import torch.nn as nn
 import torch
+import math
+from typing import Optional, Tuple
+from torch.nn import functional as F
 
 # derived nn.Module
 class RMSNorm(nn.Module):
@@ -89,3 +92,155 @@ class RMSNorm(nn.Module):
     def forward(self, x):
         return x * self._norm(x.float()).type_as(x) * self.weight
         
+
+def PreCompute_freqence_cis(dim:int,end:int(32*1024),rope_base,rope_scaling:Optional[dict]=None):
+    # __init__
+    frequence, attn_factor = (1.0/(rope_base**(torch.arange(0,dim,2)[:(dim//2)].float()/dim)),1.0)
+
+    if rope_scaling is not None:
+        original_max,factor,beta_fast,beta_slow = (
+            rope_scaling["original_max_position_embeddings"],
+            rope_scaling["factor"],
+            rope_scaling["beta_fast"],
+            rope_scaling["beta_slow"],
+        )
+    
+    # greater than original max position embedding
+    if end > original_max:
+        # b -> i
+        inv_dim = lambda b:(dim*math.log(original_max/(b*2*math.pi)))/(2*math.log(rope_base))
+        
+        low,high = (max(math.floor(inv_dim(beta_fast)),0),
+                    min(math.ceil(inv_dim(beta_slow)),dim//2))
+
+        # i < low, ramp = 0; i > high, ramp = 1; else, ramp = (i-low)/(high-low)
+        ramp = torch.clamp(
+            (torch.arange(dim//2, device=frequence.device).float() -low)/max(high-low,0.001),
+            0,
+            1)
+
+        frequence = frequence*(1-ramp+ramp/factor)
+    
+    # positional rank
+    t = torch.arange(end, device=frequence.device).float()
+
+    # get rotation angle
+    frequence = torch.outer(t,frequence).float()
+    frequence_cos = torch.cat([torch.cos(frequence),torch.cos(frequence)],dim=-1)*attn_factor
+    frequence_sin = torch.cat([torch.sin(frequence),torch.sin(frequence)],dim=-1)*attn_factor
+
+    return frequence_cos,frequence_sin
+
+# RoPE implementation
+def apply_rotory_pos_emb(q,k,frequence_cos,frequence_sin,position_ids=None,unsqueeze_dim=1):
+    # [a,b]->[-b,a]
+    def rotate_half(x):
+        return  torch.cat(
+            (-x[..., x.shape[-1]//2:], 
+             x[..., :x.shape[-1]//2]),
+            dim=-1
+        )
+    # x_rotated = x*cos+rotate_half(x)*sin
+    q_embed = (q*cos.unsqueeze(unsqueeze_dim)+
+               (rotate_half(q)*sin.unsqueeze(unsqueeze_dim)))
+    k_embed = (k*cos.unsqueeze(unsqueeze_dim)+
+                (rotate_half(k)*sin.unsqueeze(unsqueeze_dim)))
+    return q_embed,k_embed
+
+# group tensor for GQA
+def repeat_kv(x:torch.Tensor, n_rep:int)->torch.Tensor:
+    bs,slen,num_key_value_heads,head_dim = x.shape
+    if n_rep == 1:
+        return x
+    return (x[:,:,:,None,:]
+            .expand(bs,slen,num_key_value_heads,n_rep,head_dim)
+            .reshape(bs,slen,num_key_value_heads*n_rep,head_dim)
+            )# for memory efficiency, rather than repeating the tensor
+
+class Attention(nn.modules):
+    def __init__(self, args:MokioMindConfig):
+        super().__init__()
+
+        self.num_key_value_heads = args.num_key_value_heads if args.num_key_value_heads is not None else args.num_attention_heads
+        
+        assert args.num_attention_heads % self.num_key_value_heads == 0, "num_attention_heads must be divisible by num_key_value_heads"
+
+        self.n_local_heads = args.num_attention_heads
+        self.num_key_value_heads = args.num_key_value_heads
+        self.n_rep = self.n_local_heads//self.num_key_value_heads
+        self.head_dim = args.hidden_size//args.num_attention_heads
+        
+        self.q_proj = nn.Linear(args.hidden_size, args.num_attention_heads*self.head_dim, bias=False)
+        self.k_proj = nn.Linear(args.hidden_size, self.num_key_value_heads*self.head_dim, bias=False)
+        self.v_proj = nn.Linear(args.hidden_size, self.num_key_value_heads*self.head_dim, bias=False)
+        self.out_proj = nn.Linear(args.num_attention_heads*self.head_dim, args.hidden_size, bias=False)
+        
+        self.attn_dropout = nn.Dropout(args.dropout)
+        self.resid_dropout = nn.Dropout(args.dropout)
+        self.dropout=args.dropout
+
+        self.flash=hasattr(torch.nn.functional, "scaled_dot_product_attention") and args.flash_attention
+
+    # forward function
+    # q,k,v:
+    # split input into num_attention_heads and head_dim
+    # RoPE
+    # kv chache (use repeat_kv for GQA)
+    # scaled dot product attention, qxk^T/sqrt(head_dim)
+    # integrate heads and project output
+    def forward(
+            self,
+            x:torch.Tensor, 
+            position_embeddings:Tuple[torch.Tensor,torch.Tensor],past_key_values:Optional[Tuple[torch.Tensor,torch.Tensor]]=None,
+            use_cache=False,
+            attention_mask:Optional[torch.Tensor]=None,
+            ) -> torch.Tensor:
+        # calculate q,k,v
+        bsz,seq_len,_ = x.shape
+        xq,xk,xb = self.q_proj(x),self.k_proj(x),self.v_proj(x)
+        # split into num_attention_heads and head_dim
+        xq = xq.view(bsz,seq_len,self.n_local_heads,self.head_dim)#[:,:,8,64]
+        xk = xk.view(bsz,seq_len,self.num_key_value_heads,self.head_dim)
+        xv = xb.view(bsz,seq_len,self.num_key_value_heads,self.head_dim)
+        # RoPE
+        cos,sin = position_embeddings
+        xq,xk = apply_rotory_pos_emb(xq,xk,cos[:seq_len],sin[:seq_len])
+        # repeat kv for GQA (kv cache)
+        if past_key_values is not None:
+            xk = torch.cat([past_key_values[0],xk],dim=1)
+            xv = torch.cat([past_key_values[1],xv],dim=1)
+        past_kv = (xk,xv) if use_cache else None
+
+        xq,xk,xv = (
+            xq.transpose(1,2),#[bsz,n_local_heads,seq_len,head_dim]->[bsz,seq_len,n_local_heads,head_dim]
+            repeat_kv(xk,self.n_rep).transpose(1,2),#[bsz,num_key_value_heads,seq_len,head_dim]->[bsz,seq_len,num_key_value_heads*n_rep,head_dim]
+            repeat_kv(xv,self.n_rep).transpose(1,2),#[bsz,num_key_value_heads,seq_len,head_dim]->[bsz,seq_len,num_key_value_heads*n_rep,head_dim]
+        )
+        # scaled dot product attention
+        if self.flash and seq_len >1 and (attention_mask is None or torch.all(attention_mask==1)):
+            attn_mask = (
+                None
+                if attention_mask is None
+                else attention_mask.view(bsz,1,1,-1).expand(bsz,self.n_local_heads,seq_len,-1).bool()
+            )
+            output = F.scaled_dot_product_attention(xq,xk,xv,attn_mask=attn_mask,dropout_p=self.dropout if self.training else 0.0,is_causal=True)
+        else:
+            scores = (xq @ xk.transpose(-2,-1))/math.sqrt(self.head_dim)
+            # scores = scores + casual mask
+            scores = scores + torch.triu(
+                torch.full((seq_len, seq_len),float("-inf"), device=scores.device), diagonal=1
+            ).unsqueeze(0).unsqueeze(0)
+
+            if attention_mask is not None:
+                extended_attention_mask = attention_mask.unsqueeze(1).unsqueeze(2)
+                extended_attention_mask = (1.0-extended_attention_mask) * torch.finfo(scores.dtype).min
+                scores = scores + extended_attention_mask
+            # Softmax 
+            scores = F.softmax(scores.float(), dim=-1).type_as(xq)
+            scores = self.attn_dropout(scores)
+            output = scores @ xv
+        #[bsz,n_local_heads,seq_len,head_dim]->[bsz,seq_len,n_local_heads,head_dim]
+        output=output.transpose(1,2).reshape(bsz,seq_len,-1)
+        output=self.resid_dropout(self.out_proj(output))
+        return output,past_kv
+    

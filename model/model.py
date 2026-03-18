@@ -76,6 +76,7 @@ import torch
 import math
 from typing import Optional, Tuple
 from torch.nn import functional as F
+from .activation_functions import ACT2FN
 
 # derived nn.Module
 class RMSNorm(nn.Module):
@@ -93,7 +94,12 @@ class RMSNorm(nn.Module):
         return x * self._norm(x.float()).type_as(x) * self.weight
         
 
-def PreCompute_freqence_cis(dim:int,end:int(32*1024),rope_base,rope_scaling:Optional[dict]=None):
+def PreCompute_freqence_cis(
+        dim:int,
+        end:int= int(32*1024),
+        rope_base = float(1e6),
+        rope_scaling:Optional[dict]=None
+        ):
     # __init__
     frequence, attn_factor = (1.0/(rope_base**(torch.arange(0,dim,2)[:(dim//2)].float()/dim)),1.0)
 
@@ -132,7 +138,7 @@ def PreCompute_freqence_cis(dim:int,end:int(32*1024),rope_base,rope_scaling:Opti
     return frequence_cos,frequence_sin
 
 # RoPE implementation
-def apply_rotory_pos_emb(q,k,frequence_cos,frequence_sin,position_ids=None,unsqueeze_dim=1):
+def apply_rotory_pos_emb(q,k,cos,sin,position_ids=None,unsqueeze_dim=1):
     # [a,b]->[-b,a]
     def rotate_half(x):
         return  torch.cat(
@@ -157,7 +163,7 @@ def repeat_kv(x:torch.Tensor, n_rep:int)->torch.Tensor:
             .reshape(bs,slen,num_key_value_heads*n_rep,head_dim)
             )# for memory efficiency, rather than repeating the tensor
 
-class Attention(nn.modules):
+class Attention(nn.Module):
     def __init__(self, args:MokioMindConfig):
         super().__init__()
 
@@ -244,3 +250,26 @@ class Attention(nn.modules):
         output=self.resid_dropout(self.out_proj(output))
         return output,past_kv
     
+# FFN
+class FeedForward(nn.Module):
+    # init
+    # to high demension
+    # gate
+    # SwiGLU
+    # to low dimension
+    # dropout
+    def __init__(self, args:MokioMindConfig):
+        super().__init__()
+        if args.intermediate_size is None:
+            intermediate_size = int(args.hidden_size*8/3) #? experimentally, 8/3 is a good
+            args.intermediate_size = 64*((intermediate_size+64-1)//64)# upn to 64x
+
+        self.up_proj = nn.Linear(args.hidden_size,args.intermediate_size,bias=False)
+        self.down_proj = nn.Linear(args.intermediate_size,args.hidden_size,bias=False)
+        self.gate_proj = nn.Linear(args.hidden_size,args.intermediate_size,bias=False)
+        self.dropout = nn.Dropout(args.dropout)
+        self.act_fn = ACT2FN[args.hidden_act]
+
+    def forward(self,x):
+        # return self.dropout(self.down_proj(self.act_fn(self.gate_proj(x)*self.up_proj(x)))) # this is false, need to activate gate first to control the info flow
+        return self.dropout(self.down_proj(self.act_fn(self.gate_proj(x))*self.up_proj(x)))

@@ -74,9 +74,11 @@ class MokioMindConfig(PretrainedConfig):
 import torch.nn as nn
 import torch
 import math
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Union
 from torch.nn import functional as F
-from .activation_functions import ACT2FN
+from transformers.activations import ACT2FN
+from transformers import PreTrainedModel, GenerationMixin
+from transformers.modeling_outputs import CausalLMOutputWithPast
 
 # derived nn.Module
 class RMSNorm(nn.Module):
@@ -88,10 +90,10 @@ class RMSNorm(nn.Module):
         self.weight = nn.Parameter(torch.ones(dim))
 
     def _norm(self, x):
-        return torch.rsqrt(x.pow(2).mean(-1, keepdim=True)+self.eps)
+        return x*torch.rsqrt(x.pow(2).mean(-1, keepdim=True)+self.eps)
     
     def forward(self, x):
-        return x * self._norm(x.float()).type_as(x) * self.weight
+        return self._norm(x.float()).type_as(x) * self.weight
         
 
 def PreCompute_freqence_cis(
@@ -105,27 +107,28 @@ def PreCompute_freqence_cis(
 
     if rope_scaling is not None:
         original_max,factor,beta_fast,beta_slow = (
-            rope_scaling["original_max_position_embeddings"],
-            rope_scaling["factor"],
-            rope_scaling["beta_fast"],
-            rope_scaling["beta_slow"],
+            rope_scaling.get("original_max_position_embeddings",2048),
+            rope_scaling.get("factor",16),
+            rope_scaling.get("beta_fast",32.0),
+            rope_scaling.get("beta_slow",1.0),
+            rope_scaling.get("attention_factor",1.0),
         )
     
-    # greater than original max position embedding
-    if end > original_max:
-        # b -> i
-        inv_dim = lambda b:(dim*math.log(original_max/(b*2*math.pi)))/(2*math.log(rope_base))
-        
-        low,high = (max(math.floor(inv_dim(beta_fast)),0),
-                    min(math.ceil(inv_dim(beta_slow)),dim//2))
+        # greater than original max position embedding
+        if end > original_max:
+            # b -> i
+            inv_dim = lambda b:(dim*math.log(original_max/(b*2*math.pi)))/(2*math.log(rope_base))
+            
+            low,high = (max(math.floor(inv_dim(beta_fast)),0),
+                        min(math.ceil(inv_dim(beta_slow)),dim//2))
 
-        # i < low, ramp = 0; i > high, ramp = 1; else, ramp = (i-low)/(high-low)
-        ramp = torch.clamp(
-            (torch.arange(dim//2, device=frequence.device).float() -low)/max(high-low,0.001),
-            0,
-            1)
+            # i < low, ramp = 0; i > high, ramp = 1; else, ramp = (i-low)/(high-low)
+            ramp = torch.clamp(
+                (torch.arange(dim//2, device=frequence.device).float() -low)/max(high-low,0.001),
+                0,
+                1)
 
-        frequence = frequence*(1-ramp+ramp/factor)
+            frequence = frequence*(1-ramp+ramp/factor)
     
     # positional rank
     t = torch.arange(end, device=frequence.device).float()
@@ -167,12 +170,13 @@ class Attention(nn.Module):
     def __init__(self, args:MokioMindConfig):
         super().__init__()
 
-        self.num_key_value_heads = args.num_key_value_heads if args.num_key_value_heads is not None else args.num_attention_heads
+        self.num_key_value_heads = (
+            args.num_key_value_heads if args.num_key_value_heads is not None 
+            else args.num_attention_heads)
         
         assert args.num_attention_heads % self.num_key_value_heads == 0, "num_attention_heads must be divisible by num_key_value_heads"
 
         self.n_local_heads = args.num_attention_heads
-        self.num_key_value_heads = args.num_key_value_heads
         self.n_rep = self.n_local_heads//self.num_key_value_heads
         self.head_dim = args.hidden_size//args.num_attention_heads
         
@@ -272,4 +276,141 @@ class FeedForward(nn.Module):
 
     def forward(self,x):
         # return self.dropout(self.down_proj(self.act_fn(self.gate_proj(x)*self.up_proj(x)))) # this is false, need to activate gate first to control the info flow
-        return self.dropout(self.down_proj(self.act_fn(self.gate_proj(x))*self.up_proj(x)))
+        return self.dropout(
+            self.down_proj(
+                self.act_fn(self.gate_proj(x))*self.up_proj(x)
+                ))
+
+# Transformer block
+class Block(nn.Module):
+    def __init__(self, layer_id:int, config:MokioMindConfig):
+        super().__init__()
+        self.num_attention_heads = config.num_attention_heads
+        self.hidden_size = config.hidden_size
+        self.head_dim = self.hidden_size//self.num_attention_heads
+        self.self_attn = Attention(config)
+        self.layer_id = layer_id
+        self.input_layernorm = RMSNorm(self.hidden_size,eps= config.rms_norm_eps)
+        self.post_attention_layernorm = RMSNorm(self.hidden_size,eps= config.rms_norm_eps)
+        self.mlp = FeedForward(config)
+    
+    def forward(self,hidden_states,position_embeddings,past_key_values=None,use_cache=False,attention_mask=None):
+        residual = hidden_states # backup hidden
+        hidden_states,present_key_value = self.self_attn(
+            self.input_layernorm(hidden_states), # norm -> attn
+            position_embeddings,
+            past_key_values,
+            use_cache,
+            attention_mask,
+            )
+        hidden_states = residual + hidden_states # attn residual
+        hidden_states = hidden_states + self.mlp(self.post_attention_layernorm(hidden_states)) # norm -> FFN
+        return hidden_states,present_key_value
+
+class Model(nn.Module):
+    def __init__(self, config:MokioMindConfig):
+        super().__init__()
+        self.config = config
+        self.vocab_size,self.num_hidden_layers=(
+            config.vocab_size,
+            config.num_hidden_layers,
+        )
+        # Token embeddings
+        self.embed_tokens=nn.Embedding(config.vocab_size,config.hidden_size)
+        self.dropout = nn.Dropout(config.dropout)
+        self.layers = nn.ModuleList([Block(i,config)] for i in range(self.num_hidden_layers))
+        self.norm = RMSNorm(config.hidden_size,eps= config.rms_norm_eps)
+        # RoPE precompute (a buffer, reduce repeat computation)
+        freqs_cos,freqs_sin = PreCompute_freqence_cis(
+            config.hidden_size//config.num_attention_heads,
+            end=config.max_position_embeddings,
+            rope_base=config.rope_theta,
+            rope_scaling=config.rope_scaling,
+        )
+        self.register_buffer("freqs_cos", freqs_cos, persistent=False)
+        self.register_buffer("freqs_sin", freqs_sin, persistent=False)
+
+    def forward(
+            self,
+            input_ids:Optional[torch.Tensor]=None,
+            attention_mask:Optional[torch.Tensor]=None,
+            past_key_values:Optional[Tuple[torch.Tensor]]=None,
+            use_cache=False,
+            **kwargs,
+    ):
+        batch_size, seq_len = input_ids.shape
+
+        # resovle the compatibility issue (cant understand, pass)
+        if hasattr(self, "freqs_cos"):
+            past_key_values = None
+
+        past_key_values = past_key_values or [None]*len(self.layers)
+        
+        start_pos = past_key_values[0][0].shape[1] if past_key_values[0] is not None else 0
+        hidden_states = self.dropout(self.embed_tokens(input_ids))
+        position_embeddings = (
+            self.freqs_cos[start_pos:start_pos + seq_len],
+            self.freqs_sin[start_pos:start_pos + seq_len],
+        )
+
+        presents = []
+        for _, (layer, _past_key_values) in enumerate( # _ is layer index
+            zip(self.layers, past_key_values)
+            ):
+            hidden_states,_present=layer(
+                hidden_states,
+                position_embeddings,
+                past_key_values=_past_key_values,
+                use_cache=use_cache,
+                attention_mask=attention_mask,
+            )
+            presents.append(_present)
+
+        hidden_states = self.norm(hidden_states)
+
+        return hidden_states,presents
+    
+class CausalLM(PreTrainedModel, GenerationMixin):# Huggingface/s
+    config_class = MokioMindConfig
+
+    def __init__(self, config:MokioMindConfig):
+        self.config = config
+        super().__init__(config)
+        self.model = Model(config)
+        self.lm_head = nn.Linear(
+            self.config.hidden_size, self.config.vocab_size,bias=False
+        )
+
+        self.model.embed_tokens.weight = self.lm_head.weight # share weight for output and next input
+        # self.OUT = CausalLMOutputWithPast() # from huggingface
+        ## ↑, deleted for uninformed
+
+    def forward(
+            self,
+            inpout_ids:Optional[torch.Tensor]=None,
+            attention_mask:Optional[torch.Tensor]=None,
+            past_key_values:Optional[Tuple[Tuple[torch.Tensor]]]=None,
+            use_cache:bool=False,
+            Logits_to_keep:Union[int,torch.Tensor]=0,
+            **args,):
+        hidden_states,past_key_values = self.model(
+            inpout_ids = inpout_ids,
+            attention_mask = attention_mask,
+            past_key_values = past_key_values,
+            use_cache = use_cache,
+            **args,
+        )
+        # initialize output logits
+        slice_indices=(
+            slice(-Logits_to_keep,None) if isinstance(Logits_to_keep,int) 
+            else Logits_to_keep)
+        # [bsz,seq_len,hidden_size] -> [bsz,1(slice_indices),hidden_size]
+        # lm_head: [bsz,1,hidden_size] -> [bsz,1,vocab_size]
+        logits = self.lm_head(hidden_states[:,slice_indices,:]) 
+
+        # informed output
+        return CausalLMOutputWithPast(
+            logits=logits,
+            past_key_values=past_key_values,
+            hidden_states=hidden_states,
+        )

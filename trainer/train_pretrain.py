@@ -51,9 +51,13 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
 
         with autocast_ctx:
             # forward
-            res=model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
+            res = model(
+                input_ids=input_ids, labels=labels, attention_mask=attention_mask
+            ) 
             #loss
-            loss =res.loss+res.aux_loss 
+            loss =res.loss 
+            if hasattr(res,'aux_loss'):
+                loss=loss+res.aux_loss
             loss=loss/ args.accumulation_steps # avarage loss
         scaler.scale(loss).backward()
         # gradient accumulation

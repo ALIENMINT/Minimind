@@ -318,7 +318,7 @@ class Model(nn.Module):
         # Token embeddings
         self.embed_tokens=nn.Embedding(config.vocab_size,config.hidden_size)
         self.dropout = nn.Dropout(config.dropout)
-        self.layers = nn.ModuleList([Block(i,config)] for i in range(self.num_hidden_layers))
+        self.layers = nn.ModuleList([Block(i,config) for i in range(self.num_hidden_layers)])
         self.norm = RMSNorm(config.hidden_size,eps= config.rms_norm_eps)
         # RoPE precompute (a buffer, reduce repeat computation)
         freqs_cos,freqs_sin = PreCompute_freqence_cis(
@@ -368,7 +368,12 @@ class Model(nn.Module):
 
         hidden_states = self.norm(hidden_states)
 
-        return hidden_states,presents
+        aux_loss = sum(
+        [layer.mlp.aux_loss for layer in self.layers if hasattr(layer.mlp, 'aux_loss')],
+        hidden_states.new_zeros(1).squeeze(),
+    )
+
+        return hidden_states,presents,aux_loss
     
 class CausalLM(PreTrainedModel, GenerationMixin):# Huggingface/s
     config_class = MokioMindConfig
@@ -387,14 +392,15 @@ class CausalLM(PreTrainedModel, GenerationMixin):# Huggingface/s
 
     def forward(
             self,
-            inpout_ids:Optional[torch.Tensor]=None,
+            input_ids:Optional[torch.Tensor]=None,
             attention_mask:Optional[torch.Tensor]=None,
+            labels: Optional[torch.Tensor] = None,
             past_key_values:Optional[Tuple[Tuple[torch.Tensor]]]=None,
             use_cache:bool=False,
             Logits_to_keep:Union[int,torch.Tensor]=0,
             **args,):
-        hidden_states,past_key_values = self.model(
-            inpout_ids = inpout_ids,
+        hidden_states,past_key_values,aux_loss = self.model(
+            input_ids = input_ids,
             attention_mask = attention_mask,
             past_key_values = past_key_values,
             use_cache = use_cache,
@@ -408,9 +414,23 @@ class CausalLM(PreTrainedModel, GenerationMixin):# Huggingface/s
         # lm_head: [bsz,1,hidden_size] -> [bsz,1,vocab_size]
         logits = self.lm_head(hidden_states[:,slice_indices,:]) 
 
+        # loss
+        loss = None
+        if labels is not None:
+            shift_logits = logits[..., :-1, :].contiguous()
+            shift_labels = labels[..., 1:].contiguous()
+            loss = F.cross_entropy(
+                shift_logits.view(-1, shift_logits.size(-1)),
+                shift_labels.view(-1),
+                ignore_index=-100,
+            )
+
         # informed output
-        return CausalLMOutputWithPast(
+        output = CausalLMOutputWithPast(
+            loss=loss,
             logits=logits,
             past_key_values=past_key_values,
             hidden_states=hidden_states,
         )
+        output.aux_loss = aux_loss
+        return output

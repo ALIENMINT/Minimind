@@ -1,1 +1,1 @@
-## minimind试做练习，训练完后，推理出错，仅作为记录
+## Reproduced [minimind](https://github.com/jingyaogong/minimind)
